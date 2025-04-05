@@ -1,17 +1,21 @@
 //! Utilities and definitions for config handling
 
-use crate::input_processing::TreeSitterProcessor;
-use crate::{cli::Args, parse::GrammarConfig, render::RenderConfig};
-use anyhow::{Context, Result};
-use figment::{self, providers::Format, Provider};
-use json5 as json;
+use crate::{
+    cli::Args, figment_utils::JsonProvider, input_processing::TreeSitterProcessor,
+    parse::GrammarConfig, render::RenderConfig,
+};
+use anyhow::Result;
+use figment::{
+    self,
+    providers::{Format, Serialized},
+    Figment,
+};
 use log::info;
 use serde::{Deserialize, Serialize};
-use std::ffi::OsStr;
-use std::ops::Deref;
 use std::{
     collections::HashMap,
-    fs, io,
+    ffi::OsStr,
+    io,
     path::{Path, PathBuf},
 };
 use thiserror::Error;
@@ -78,28 +82,25 @@ impl Config {
     /// default config file path is supposed to be (based on OS conventions, see
     /// [`default_config_file_path`]).
     ///
+    /// # Args
+    ///
+    /// * path: An optional path. If `None` is provided, then try to find the default config file
+    ///   path, unless `no_config` is set to true.
+    /// * no_config: Corresponds to the `--no-config` CLI option.
+    ///
     /// # Errors
     ///
     /// This method will return an error if the config cannot be parsed or if no default config
     /// exists.
-    pub fn try_from_file<P: AsRef<Path>>(path: Option<&P>) -> Result<Self, ReadError> {
-        // rustc will emit an incorrect warning that this variable isn't used, which is untrue.
-        // While the variable isn't read *directly*, it is used to store the owned PathBuf from
-        // `default_config_file_path` so we can use the reference to the variable in `config_fp`.
-        #[allow(unused_assignments)]
-        let mut default_config_fp = PathBuf::new();
-
-        let config_fp = if let Some(p) = path {
-            p.as_ref()
-        } else {
-            default_config_fp = default_config_file_path().map_err(|_| ReadError::NoDefault)?;
-            default_config_fp.as_ref()
+    pub fn try_from_file<P: AsRef<Path>>(path: Option<&P>, no_config: bool) -> Result<Self> {
+        let fig: Figment = {
+            let mut fig = figment::Figment::from(Serialized::defaults(Config::default()));
+            if let Some(cfg_path) = get_config_path_from_args(path, no_config) {
+                fig = merge_fig_provider_from_ext(fig, &cfg_path)?;
+            }
+            fig
         };
-        info!("Reading config at {}", config_fp.to_string_lossy());
-        let config_contents = fs::read_to_string(config_fp)?;
-        let config = json::from_str(&config_contents)
-            .with_context(|| format!("Failed to parse config at {}", config_fp.to_string_lossy()))
-            .map_err(ReadError::DeserializationFailure)?;
+        let config: Config = fig.extract()?;
         Ok(config)
     }
 
@@ -112,68 +113,63 @@ impl Config {
     /// - config files specified at the command line
     /// - the hardcoded defaults
     // TODO: check if we can incorporate clap or add the command line flags somehow
-    pub fn new(cli_args: &Args) -> Result<Self> {
-        use figment::{
-            providers::{Env, Serialized},
-            Figment,
-        };
-        let fig: Figment = {
-            let mut fig = figment::Figment::from(Serialized::defaults(Config::default()));
-            let cfg_paths = config_file_path_helper(cli_args)?;
-            // Most important paths come first, but with fig we reverse the order so the most
-            // important sources override the sources with lower precedence.
-            for path in cfg_paths.iter().rev() {
-                fig = fig_file_format_helper(fig, path)?;
-            }
-            fig.merge(Env::prefixed(ENV_CFG_PREFIX))
-        };
-        Ok(fig.extract()?)
+    pub fn new_from_args(cli_args: &Args) -> Result<Self> {
+        Self::try_from_file(cli_args.config.as_ref(), cli_args.no_config)
     }
 }
 
-/// Get the file paths to read the config from based on the command line arguments, in order of
-/// precedence.
+/// Select the file path for the diffsitter config.
 ///
-/// This can return an empty vector if the user specifies the --no-config flag, which means we should only use
-/// the built-in default values.
+/// This will return `None` if the `--no-config` flag is selected by the user. Otherwise it will
+/// look for the first existing config path found in order of precedence.
 ///
-/// The return value lists files in order of highest precedence to lowest precedence.
-fn config_file_path_helper(args: &Args) -> Result<Vec<PathBuf>> {
-    if args.no_config {
-        return Ok(Vec::new());
+/// The search list for config paths (unless `--no-config` is selected)
+///
+/// * path specified by `--config` at the CLI (if applicable)
+/// * path specified by `DIFFSITTER_CONFIG` environment variable
+/// * default config file path
+fn get_config_path_from_args<P: AsRef<Path>>(
+    supplied_path: Option<&P>,
+    no_config: bool,
+) -> Option<PathBuf> {
+    if no_config {
+        return None;
     }
-    let mut res = Vec::new();
-    if let Some(path) = &args.config {
-        res.push(path.clone());
+    if let Some(path) = supplied_path {
+        return Some(PathBuf::from(path.as_ref()));
     }
-    res.push(default_config_file_path()?);
-    Ok(res)
+    default_config_file_path().ok()
 }
 
-/// Helper function that dispatches a parser based on the file extension.
+/// Merge the given path's figment data.
 ///
-/// We have this because the app uses JSON files for configs, which was done because of some old
-/// issues with the TOML crate and a mistake around serde and defaults. This app will migrate to
-/// TOML, but we will continue allowing JSON so we don't break people's workflows.
+/// This is a helper function that constructs the correct figment provider for a given config path
+/// based on the file's path extension. We can't return the figment provider directly, which would
+/// be nicer, because the provider has to be sized and there's no way to generally handle this.
 ///
-/// The function takes the figment as an argument because we can't return the objects generically
-/// as dyn Traits (they need to be sized), and you can't use return impl since we might return
-/// differnt types, so we just merge with the figment in this function.
-fn fig_file_format_helper(fig: figment::Figment, path: &Path) -> Result<figment::Figment> {
-    use figment::providers::{Json, Toml};
-    let ext = {
-        if let Some(ext) = path.extension().and_then(OsStr::to_str) {
-            ext
-        } else {
+/// # Supported extensions
+///
+/// * .json
+/// * .json5
+/// * .toml
+///
+/// # Errors
+///
+/// This will return an error the extension is not one of the known extensions.
+fn merge_fig_provider_from_ext(fig: figment::Figment, path: &Path) -> Result<figment::Figment> {
+    use figment::providers::Toml;
+    let ext = path.extension().map_or_else(
+        || {
             anyhow::bail!(
                 "Config path {} does not have a valid extension",
                 path.to_string_lossy()
-            );
-        }
-    };
+            )
+        },
+        |x| OsStr::to_str(x).ok_or(anyhow::anyhow!("Could not map to OsStr")),
+    )?;
     match ext {
-        ".json" | ".json5" => Ok(fig.merge(Json::file(path))),
-        ".toml" => Ok(fig.merge(Toml::file(path))),
+        "json5" | "json" => Ok(fig.merge(JsonProvider::file(path))),
+        "toml" => Ok(fig.merge(Toml::file(path))),
         _ => Err(anyhow::anyhow!("Unrecognized extension {ext}")),
     }
 }
@@ -216,11 +212,11 @@ mod tests {
             .iter()
             .collect::<PathBuf>();
         assert!(sample_config_path.exists());
-        Config::try_from_file(Some(sample_config_path).as_ref()).unwrap();
+        Config::try_from_file(Some(sample_config_path).as_ref(), false).unwrap();
     }
 
     #[test]
-    fn test_configs() {
+    fn test_config_init() {
         let mut test_config_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
         test_config_dir.push("resources/test_configs");
         assert!(test_config_dir.is_dir());
@@ -238,7 +234,7 @@ mod tests {
             // We add the context so if there is an error you'll see the actual deserialization
             // error from serde and which file it failed on, which makes for a much more
             // informative error message in the test logs.
-            Config::try_from_file(Some(&config_file_path))
+            Config::try_from_file(Some(&config_file_path), false)
                 .with_context(|| {
                     format!(
                         "Parsing file {}",
