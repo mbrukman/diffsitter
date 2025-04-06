@@ -444,6 +444,7 @@ fn main() -> anyhow::Result<()> {
     // Needed so tests are rerun if we change/update any of the test input files. Otherwise Cargo
     // won't know to actually rerun the tests.
     println!("cargo::rerun-if-changed=resources/test_configs");
+    println!("cargo::rerun-if-changed=assets/sample_config.json5");
     println!("cargo::rerun-if-env-changed=BASE_TEST_DIR");
     Ok(())
 }
