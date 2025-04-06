@@ -282,6 +282,10 @@ impl RenderConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use figment::{
+        providers::{Env, Format, Toml},
+        Figment, Jail,
+    };
     use test_case::test_case;
 
     #[test]
@@ -314,5 +318,36 @@ mod tests {
         let cfg = RenderConfig::default();
         let res = cfg.get_renderer(Some(tag.into()));
         assert!(res.is_ok());
+    }
+
+    // Tests that we can provide partial keys for custom tags when using figment.
+    #[test]
+    fn test_parse_partial_defaults_custom_tag() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "partial_custom_tag.toml",
+                r#"
+            [custom]
+            [custom.custom_render_tag]
+            type = "unified"
+            addition = { regular-foreground = "green"}
+            "#,
+            )?;
+            let render_config: RenderConfig = Figment::new()
+                .merge(Toml::file("partial_custom_tag.toml"))
+                .extract()?;
+            let mut expected: Unified = Unified::default();
+            expected.addition.regular_foreground = Color::Green;
+            let actual = render_config.custom.get("custom_render_tag").unwrap();
+            if let Renderers::Unified(actual) = actual {
+                assert_eq!(*actual, expected);
+            } else {
+                panic!(
+                    "Did not get expected unified render type in config, got {:#?}",
+                    actual
+                );
+            }
+            Ok(())
+        });
     }
 }
