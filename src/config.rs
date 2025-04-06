@@ -201,8 +201,10 @@ fn default_config_file_path() -> Result<PathBuf> {
 mod tests {
     use super::*;
     use anyhow::Context;
-    use std::{env, fs::read_dir};
+    use rstest::*;
+    use std::env;
 
+    // Tests the sample config that's in the docs
     #[test]
     fn test_sample_config() {
         let repo_root =
@@ -215,33 +217,41 @@ mod tests {
         Config::try_from_file(Some(sample_config_path).as_ref(), false).unwrap();
     }
 
-    #[test]
-    fn test_config_init() {
-        let mut test_config_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-        test_config_dir.push("resources/test_configs");
-        assert!(test_config_dir.is_dir());
+    // NOTE: we have to provide the file paths explicitly in the code, otherwise Rust won't know to
+    // rerun if we add a new test case, for example. This is also the most ergonomic way to
+    // parametrize on each file name so we can easily see which case failed.
+    #[rstest]
+    #[case("empty_dict.json5")]
+    #[case("partial_section_1.json")]
+    #[case("partial_section_2.json")]
+    #[case("partial_section_3.json")]
+    #[case("empty_config.toml")]
+    #[case("partial_section_1.toml")]
+    fn test_config_init(#[case] filename: &str) {
+        let mut config_file_path = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+        config_file_path.push("resources/test_configs");
+        assert!(
+            config_file_path.is_dir(),
+            "test resource directory `{}` was not found",
+            config_file_path.to_string_lossy()
+        );
+        config_file_path.push(filename);
+        assert!(
+            config_file_path.is_file(),
+            "Expected test case file {} doesn't exist",
+            config_file_path.to_string_lossy()
+        );
 
-        for config_file_path in read_dir(test_config_dir).unwrap() {
-            let config_file_path = config_file_path.unwrap().path();
-            let has_correct_ext = if let Some(ext) = config_file_path.extension() {
-                ext == "json5"
-            } else {
-                false
-            };
-            if !config_file_path.is_file() || !has_correct_ext {
-                continue;
-            }
-            // We add the context so if there is an error you'll see the actual deserialization
-            // error from serde and which file it failed on, which makes for a much more
-            // informative error message in the test logs.
-            Config::try_from_file(Some(&config_file_path), false)
-                .with_context(|| {
-                    format!(
-                        "Parsing file {}",
-                        &config_file_path.file_name().unwrap().to_string_lossy()
-                    )
-                })
-                .unwrap();
-        }
+        // We add the context so if there is an error you'll see the actual deserialization
+        // error from serde and which file it failed on, which makes for a much more
+        // informative error message in the test logs.
+        Config::try_from_file(Some(&config_file_path), false)
+            .with_context(|| {
+                format!(
+                    "Error parsing file: {}",
+                    &config_file_path.file_name().unwrap().to_string_lossy()
+                )
+            })
+            .unwrap();
     }
 }
